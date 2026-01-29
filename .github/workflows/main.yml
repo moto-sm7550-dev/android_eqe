@@ -1,0 +1,115 @@
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      android:
+        description: 'Select ROM to Build'
+        required: true
+        default: 'LineageOS'
+        type: choice
+        options: [LineageOS, Evolution-X]
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.server_host }}
+          username: ${{ secrets.server_user }}
+          key: ${{ secrets.server_key }}
+          script: |
+            mkdir actions-runner && cd actions-runner
+            VERSION=$(curl -s "https://api.github.com/repos/actions/runner/releases/latest" | grep -oP '"tag_name": "\K[^"]*' | sed 's/^v//')
+            curl -LSs https://github.com/actions/runner/releases/download/v$VERSION/actions-runner-linux-x64-$VERSION.tar.gz | tar xz
+
+            TOKEN=$(curl -sX POST -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: token ${{ secrets.gh_token }}" \
+              https://api.github.com/repos/${{ github.repository }}/actions/runners/registration-token | jq .token --raw-output)
+
+            ./config.sh --url https://github.com/${{ github.repository }} --token $TOKEN --unattended --replace
+            nohup ./run.sh > run.log 2>&1 &
+
+  build:
+    needs: setup
+    runs-on: self-hosted
+    defaults:
+      run:
+        working-directory: ${{ vars.android_source }}
+    env:
+      self: https://raw.githubusercontent.com/${{ github.repository }}/refs/heads/main
+
+    steps:
+      - name: Configure ROM Variables
+        id: config
+        run: |
+          case "${{ inputs.android }}" in
+            "LineageOS")
+              manifest="https://github.com/LineageOS/android.git"
+              branch="lineage-23.2"
+              target="bacon"
+              variant="userdebug"
+            ;;
+            "Evolution-X")
+              manifest="https://github.com/Evolution-X/manifest.git"
+              branch="bq2"
+              target="evolution"
+              variant="user"
+            ;;
+          esac
+
+          {
+            echo "android_manifest=$manifest"
+            echo "android_manifest_branch=$branch"
+            echo "android_build_variant=$variant"
+            echo "android_build_target=$target"
+          } >> $GITHUB_ENV
+
+      - name: Prepare Source
+        run: |
+          rm -rf .repo/local_manifests
+          repo init --git-lfs -u ${{ env.android_manifest }} -b ${{ env.android_manifest_branch }}
+          git clone https://github.com/${{ github.repository_owner }}/android_local_manifests.git .repo/local_manifests
+          curl -LSs ${{ env.self }}/scripts/sync.sh | bash
+          cd device/motorola/eqe && curl -LSs ${{ env.self }}/patches/${{ inputs.android }}.patch | git am
+
+      - name: Compile Source
+        env:
+          UTILS: ${{ env.self }}
+        run: |
+          source <(curl -LSs ${{ env.self }}/scripts/envsetup.sh)
+          breakfast eqe ${{ env.android_build_variant }}
+          cmka ${{ env.android_build_target }}
+
+      - name: Display Build Errors
+        if: failure()
+        run: cat out/error.log
+
+      - name: Upload Build Artifacts
+        run: |
+          FILTERS=( --max-depth 1 --filter "- *-ota.zip" --filter "+ *.zip" --filter "- *" )
+          rclone copy "${FILTERS[@]}" out/target/product/eqe/ SourceForge:/home/frs/project/eqe/${{ inputs.android }}/
+          rclone copy "${FILTERS[@]}" out/target/product/eqe/ GoogleDrive:/Android/${{ inputs.android }}/
+
+  cleanup:
+    if: always()
+    needs: [setup, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove Runner
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.server_host }}
+          username: ${{ secrets.server_user }}
+          key: ${{ secrets.server_key }}
+          script: |
+            cd actions-runner
+
+            TOKEN=$(curl -sX POST -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: token ${{ secrets.gh_token }}" \
+              https://api.github.com/repos/${{ github.repository }}/actions/runners/remove-token | jq .token --raw-output)
+
+            ./config.sh remove --token $TOKEN
+            cd .. && rm -rf actions-runner

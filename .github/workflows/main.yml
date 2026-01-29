@@ -1,0 +1,82 @@
+name: Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.server_host }}
+          username: ${{ secrets.server_user }}
+          key: ${{ secrets.server_key }}
+          script: |
+            mkdir actions-runner && cd actions-runner
+            VERSION=$(curl -s "https://api.github.com/repos/actions/runner/releases/latest" | grep -oP '"tag_name": "\K[^"]*' | sed 's/^v//')
+            curl -LSs https://github.com/actions/runner/releases/download/v$VERSION/actions-runner-linux-x64-$VERSION.tar.gz | tar xz
+
+            TOKEN=$(curl -sX POST -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: token ${{ secrets.gh_token }}" \
+              https://api.github.com/repos/${{ github.repository }}/actions/runners/registration-token | jq .token --raw-output)
+
+            ./config.sh --url https://github.com/${{ github.repository }} --token $TOKEN --unattended --replace
+            nohup ./run.sh > run.log 2>&1 &
+
+  build:
+    needs: setup
+    runs-on: self-hosted
+    defaults:
+      run:
+        working-directory: ${{ vars.android_source }}
+    env:
+      android_utils: https://raw.githubusercontent.com/${{ github.repository_owner }}/android_utils/refs/heads/main
+
+    steps:
+      - name: Prepare Source
+        run: |
+          rm -rf .repo/local_manifests
+          repo init --git-lfs -u ${{ vars.android_manifest }} -b ${{ vars.android_manifest_branch }}
+          git clone https://github.com/${{ github.repository_owner }}/android_local_manifests.git .repo/local_manifests
+          curl -LSs ${{ env.android_utils }}/scripts/sync.sh | bash
+          cd device/motorola/eqe && curl -LSs ${{ env.android_utils }}/patches/${{ github.event.repository.name }}.patch | git am
+
+      - name: Compile Source
+        env:
+          UTILS: ${{ env.android_utils }}
+        run: |
+          source <(curl -LSs ${{ env.android_utils }}/scripts/envsetup.sh)
+          breakfast eqe ${{ vars.android_build_variant }}
+          cmka ${{ vars.android_build_target }}
+
+      - name: Display Build Errors
+        if: failure()
+        run: cat out/error.log
+
+      - name: Upload Build Artifacts
+        run: |
+          FILTERS=( --max-depth 1 --filter "- *-ota.zip" --filter "+ *.zip" --filter "- *" )
+          rclone copy "${FILTERS[@]}" out/target/product/eqe/ SourceForge:/home/frs/project/eqe/${{ vars.android }}/
+
+  cleanup:
+    if: always()
+    needs: [setup, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove Runner
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.server_host }}
+          username: ${{ secrets.server_user }}
+          key: ${{ secrets.server_key }}
+          script: |
+            cd actions-runner
+
+            TOKEN=$(curl -sX POST -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: token ${{ secrets.gh_token }}" \
+              https://api.github.com/repos/${{ github.repository }}/actions/runners/remove-token | jq .token --raw-output)
+
+            ./config.sh remove --token $TOKEN
+            cd .. && rm -rf actions-runner
